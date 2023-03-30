@@ -1,0 +1,184 @@
+configfile: "./config.yaml"
+
+GenoQC = config["GenoQC"]
+HweQC = config["HweQC"]
+MindQC = config["MindQC"]
+
+SAMPLES = ["input"]
+BED_FORMAT = [ "bed", "bim","fam"]
+SHAPEIT4_FORMAT = ["hap.gz","sample"]
+
+rule all: 
+    input:
+        expand("data/raw-samples/{all_genome_variants}.vcf.gz", all_genome_variants=SAMPLES)
+
+
+rule rename_chromosomes:
+    input:
+        "data/raw-samples/{all_genome_variants}.vcf.gz",
+        "data/reference/RefAnnotationData/PlinkChrRename.txt"
+    output:
+        "data/pipeline/01-01-Rename-Chromosomes/{all_genome_variants}.bcf"
+    params:
+        variants  = "raw-samples/{all_genome_variants}.vcf.gz",
+        chr_name_mapping = "reference/RefAnnotationData/PlinkChrRename.txt",
+        variants_Chr_renamed_bcf = "pipeline/01-01-Rename-Chromosomes/{all_genome_variants}.bcf"
+    shell:
+        "docker run --rm --user $(id -u):$(id -g)  -v ./data/:/data app-bio/bcftools bcftools annotate -Ob --rename-chrs  {params.chr_name_mapping} {params.variants}  -o {params.variants_Chr_renamed_bcf}"
+        
+
+rule allign_to_ref_annotation:
+    input:
+        "data/pipeline/01-01-Rename-Chromosomes/{all_genome_variants}.bcf",
+        "data/reference/RefAnnotationData/human_g1k_v37.fasta.gz"
+    output:
+        "data/pipeline/01-02-Alligne-To-Ref-Annotation/{all_genome_variants}.bcf"
+
+    params:
+        variants_Chr_renamed_bcf = "pipeline/01-01-Rename-Chromosomes/{all_genome_variants}.bcf",
+        ref_annotation = "/reference/RefAnnotationData/human_g1k_v37.fasta.gz",
+        ref_variants = "/reference/RefAnnotationData/All_20170710.vcf.gz",
+        alligned_to_ref_annotation = "/pipeline/01-02-Alligne-To-Ref-Annotation/{all_genome_variants}.bcf"
+    shell:
+        """
+            docker run --rm --user $(id -u):$(id -g)  -v ./data/:/data app-bio/bcftools bcftools  \
+            +fixref  {params.variants_Chr_renamed_bcf} -- -f {params.ref_annotation}
+
+            docker run --rm --user $(id -u):$(id -g)  -v ./data/:/data app-bio/bcftools bcftools  \
+            +fixref  {params.variants_Chr_renamed_bcf} -Ob -o {params.alligned_to_ref_annotation} --  -d -f {params.ref_annotation}  -i {paramas.ref_variants}
+
+            docker run --rm --user $(id -u):$(id -g)  -v ./data/:/data app-bio/bcftools bcftools  \
+            +fixref  {params.variants_Chr_renamed_bcf} -- -f {params.ref_annotation}
+
+        """
+
+rule short_alligned_file:
+    input:
+        "/pipeline/01-02-Alligne-To-Ref-Annotation/{all_genome_variants}.bcf",
+        "data/pipeline/01-03-Short-Alligne-File/{all_genome_variants}.bcf"
+    output:
+        "data/pipeline/01-03-Short-Alligned-File/{all_genome_variants}.bcf"
+
+    params:
+        alligned_to_ref_annotation = "/pipeline/01-02-Alligned-To-Ref-Annotation/{all_genome_variants}.bcf",
+        shorted = "data/pipeline/01-03-Short-Alligned-File/{all_genome_variants}.bcf"
+    shell:
+        """
+            docker run --rm --user $(id -u):$(id -g)  -v ./data/:/data app-bio/bcftools bcftools  \
+            sort  -Ob -o {params.shorted}
+        """
+
+
+rule convert_alligned_to_bed:
+    input:
+        "data/pipeline/01-03-Short-Alligned-File/{all_genome_variants}.bcf"
+    output:
+        export ("data/pipeline/01-04-Convert-Shorted-File/{all_genome_variants}.{ext}", ext= BED_FORMAT)
+
+    params:
+        shorted = "pipeline/01-03-Short-Alligned-File/{all_genome_variants}.bcf",
+        converted_bed = "pipeline/01-04-Convert-Shorted-File/{all_genome_variants}"
+    shell:
+        """
+            docker run --rm --user $(id -u):$(id -g)  -v ./data/:/data app-bio/plink plink  \
+            --bcf {params.shorted} --make-bed --out {params.converted_bed}
+        """
+
+
+rule remove_duplicates_from_bed:
+    input:
+        export ("data/pipeline/01-04-Convert-Shorted-File/{all_genome_variants}.{ext}", ext= BED_FORMAT)
+    output:
+        export("data/pipeline/01-05-Remove-Duplicates/{all_genome_variants}.{ext}", ext = BED_FORMAT ),
+        "data/pipeline/01-05-Remove-Duplicates/duplicates_to_remove"
+
+    params:
+        converted_bed = "pipeline/01-04-Convert-Shorted-File/{all_genome_variants}",
+        duplicates = "pipeline/01-05-Remove-Duplicates/duplicates_to_remove",
+        no_duplicates = "pipeline/01-05-Remove-Duplicates/{all_genome_variants}"
+    shell:
+        """
+            docker run --rm --user $(id -u):$(id -g)  -v ./data/:/data app-bio/plink plink  \
+            --bfile {params.converted_bed} --list-duplicate-vars ids-only suppress-first --out {params.duplicates}
+
+            docker run --rm --user $(id -u):$(id -g)  -v ./data/:/data app-bio/plink plink  \
+            --bfile {params.converted_bed} --exclude {params.duplicates} --make-bed --out {params.no_duplicates}
+
+        """
+
+
+rule remove_low_quality_genotypes:
+    input:
+        export("data/pipeline/01-05-Remove-Duplicates/{all_genome_variants}.{ext}", ext = BED_FORMAT )
+    output:
+        export("data/pipeline/02-01-Remove-Low-Quality/{all_genome_variants}_qc1.{ext}", ext = BED_FORMAT),
+        export("data/pipeline/02-01-Remove-Low-Quality/{all_genome_variants}_qc2.{ext}", ext = BED_FORMAT)
+
+    params:
+        no_duplicates = "pipeline/01-05-Remove-Duplicates/{all_genome_variants}",
+        filtered_qc1 = "pipeline/02-01-Remove-Low-Quality/{all_genome_variants}_qc1",
+        filtered_qc2 = "pipeline/02-01-Remove-Low-Quality/{all_genome_variants}_qc2",
+    shell:
+        """
+            docker run --rm --user $(id -u):$(id -g)  -v ./data/:/data app-bio/plink plink  \
+            --allow-no-sex --bfile {params.no_duplicates} --geno {GenoQC} --hwe {HweQC} --maf ${MafQC} --make-bed --out {params.filtered_qc1}
+
+            docker run --rm --user $(id -u):$(id -g)  -v ./data/:/data app-bio/plink plink  \
+            --allow-no-sex --bfile {params.filtered_qc1} --mind {MindQC} --out {params.filtered_qc2}
+        """
+
+rule split_by_chromosome:
+    input:
+        export("data/pipeline/02-01-Remove-Low-Quality/{all_genome_variants}_qc2.{ext}", ext = BED_FORMAT)
+    output:
+        export("data/pipeline/02-02-Split-By-Chromosome/{all_genome_variants}_Phase_Ready.chr{chr}.{ext}", chr = [ str(i) for i in range(1, 26)], ext = BED_FORMAT)
+    params:
+        filtered_qc2 = "pipeline/02-01-Remove-Low-Quality/{all_genome_variants}_qc2",
+        split_by_chromosome = "pipeline/02-02-Split-By-Chromosome/{all_genome_variants}_Phase_Ready.chr"
+    run:
+        for i in range(1,26):
+            shell ("docker run --rm --user $(id -u):$(id -g)  -v ./data/:/data app-bio/plink plink ",  \
+              "--bfile {params.filtered_qc2}   --chr ${i}} --make-bed --out  {params.splited_by_chrom}{i}"
+            )
+
+
+
+
+rule phase_chr_1_to_22:
+    input:
+        export("data/pipeline/02-02-Split-By-Chromosome/{all_genome_variants}_Phase_Ready.chr{chr}.{ext}", chr = [ str(i) for i in range(1, 26)], ext = BED_FORMAT)
+    output:
+        export("data/pipeline/03-01-Phase-By-Chromosome/{all_genome_variants}_Phase_Chr{chr}.{ext}", chr = [ str(i) for i in range(1, 22)], ext = SHAPEIT4_FORMAT)
+    params:
+        split_by_chromosome = "pipeline/02-02-Split-By-Chromosome/{all_genome_variants}_Phase_Ready.chr",
+        genetic_map = "reference/RefPanel/",
+        phazed = "pipeline/03-01-Phase-By-Chromosome//{all_genome_variants}_Phased_Chr"
+    run:
+        for i in range(1,26):
+            shell (
+                "docker run --rm --user $(id -u):$(id -g)  -v ./data/:/data app-bio/shapeit shapeit4 ",  \
+                "--thread 4 ",  \
+                "--input-bed {params.splited_by_chrom}{i} ", \
+                "--input-map {params.genetic_map} ", \
+                "-O  {params.phazed}{chr}.haps.gz {params.phazed}{chr}.sample ", \
+                "--output-log  {params.phasing_log}{chr}.log" 
+            )
+
+rule phase_chr_X:
+    input:
+        export("data/pipeline/02-02-Split-By-Chromosome/{all_genome_variants}_Phase_Ready.chr{chr}.{ext}",chr=["23"], ext = BED_FORMAT)
+    output:
+        export("data/pipeline/03-01-Phase-By-Chromosome/{all_genome_variants}_Phase_Chr{chr}.{ext}", chr = ["23"], ext = SHAPEIT4_FORMAT)
+    params:
+        chromosome_x = "pipeline/02-02-Split-By-Chromosome/{all_genome_variants}_Phase_Ready.chr23",
+        genetic_map = "reference/RefPanel/",
+        phazed = "pipeline/03-01-Phase-By-Chromosome//{all_genome_variants}_Phased_Chr23"
+    shell:
+        """
+            docker run --rm --user $(id -u):$(id -g)  -v ./data/:/data app-bio/shapeit shapeit4   \
+                --thread 4   \
+                --input-bed {params.chromosome_x}  \
+                --input-map {params.genetic_map}  \
+                -O  {params.phazed}.haps.gz {params.phazed}.sample  \
+                --output-log  {params.phasing_log}{chr}.log 
+        """
