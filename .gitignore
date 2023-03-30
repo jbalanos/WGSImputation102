@@ -1,0 +1,5 @@
+/data/**
+*/.snakemake
+*/.snakemake/**
+**/.snakemake/**
+.Rproj.user
